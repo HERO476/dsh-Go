@@ -97,6 +97,21 @@ final class IslandOpenSession extends IslandMessage {
   final String sessionId;
 }
 
+/// One chunk of a file the page wants the app to save (`t: 'save'`).
+///
+/// The island protocol is capped at [IslandMessageLimits.maxBytes] (16 KB) while
+/// a memory export can be megabytes, so a file arrives as a numbered series of
+/// chunks that the handle reassembles: `id` names the transfer, `data` is the
+/// next piece, `last` marks the end. Nothing is written until the last chunk
+/// arrives, and a transfer that never finishes is dropped with its handle.
+final class IslandSaveFile extends IslandMessage {
+  const IslandSaveFile({required this.id, required this.name, required this.data, required this.last});
+  final String id;
+  final String name;
+  final String data;
+  final bool last;
+}
+
 /// Limits on what the page may send.
 abstract final class IslandMessageLimits {
   static const maxBytes = 16 * 1024;
@@ -104,6 +119,10 @@ abstract final class IslandMessageLimits {
   static const maxExtent = 100000.0;
   static const maxUrl = 2048;
   static const maxText = 200;
+  /** A file name the app is willing to write (`memory-2026-11-12.json`). */
+  static const maxSaveName = 120;
+  /** Total bytes one `save` transfer may carry before it is abandoned. */
+  static const maxSaveBytes = 8 * 1024 * 1024;
   static final sessionId = RegExp(r'^[A-Za-z0-9._:-]{1,200}$');
 }
 
@@ -170,6 +189,14 @@ IslandMessage? parseIslandMessage(String raw) {
       final id = json['id'];
       if (id is! String || !IslandMessageLimits.sessionId.hasMatch(id)) return null;
       return IslandOpenSession(id);
+    case 'save':
+      final id = json['id'];
+      final name = json['name'];
+      final data = json['data'];
+      if (id is! String || !IslandMessageLimits.sessionId.hasMatch(id)) return null;
+      if (name is! String || name.isEmpty || name.length > IslandMessageLimits.maxSaveName) return null;
+      if (data is! String) return null;
+      return IslandSaveFile(id: id, name: name, data: data, last: json['last'] == true);
   }
   return null;
 }
