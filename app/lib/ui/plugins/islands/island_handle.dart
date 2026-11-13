@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../../../plugins/seams/seat_models.dart';
@@ -106,6 +109,12 @@ class IslandHandle extends ChangeNotifier {
   late final _files = WebFileChooser(
     canChoose: () => _phase == IslandPhase.ready && visible && views > 0 && spec.form != IslandForm.probe,
   );
+
+  /// In-flight `save` transfers, keyed by the page's transfer id. A WebView
+  /// cannot hand a `blob:` download to the system, so a page that wants to
+  /// export something sends it here in chunks instead.
+  final _saves = <String, StringBuffer>{};
+  int _saveBytes = 0;
 
   IslandPhase get phase => _phase;
   IslandPhase _phase = IslandPhase.loading;
@@ -309,6 +318,40 @@ class IslandHandle extends ChangeNotifier {
         notifyListeners();
       case IslandLink() || IslandOpenSession():
         if (_phase == IslandPhase.ready) _request(message);
+      case IslandSaveFile(:final id, :final name, :final data, :final last):
+        if (_phase == IslandPhase.ready) unawaited(_receiveSave(id, name, data, last));
+    }
+  }
+
+  /// Assembles one `save` chunk. Nothing touches the filesystem until the page
+  /// says `last`, and a transfer over [IslandMessageLimits.maxSaveBytes] is
+  /// dropped rather than allowed to grow without bound.
+  Future<void> _receiveSave(String id, String name, String data, bool last) async {
+    final buffer = _saves.putIfAbsent(id, StringBuffer.new);
+    buffer.write(data);
+    _saveBytes += data.length;
+    if (_saveBytes > IslandMessageLimits.maxSaveBytes) {
+      _saves.remove(id);
+      _saveBytes = 0;
+      return;
+    }
+    if (!last) return;
+    _saves.remove(id);
+    _saveBytes = 0;
+    final text = buffer.toString();
+    if (text.isEmpty) return;
+    try {
+      // A file name from the page is untrusted: keep it to one path segment of
+      // characters we chose, and never let it name a directory.
+      final safe = name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/$safe');
+      await file.writeAsString(text, flush: true);
+      // Sharing is the only way out of app storage the system offers without
+      // asking the user for a folder; the sheet lets them save it anywhere.
+      await SharePlus.instance.share(ShareParams(files: [XFile(file.path)]));
+    } catch (_) {
+      // No share target, no storage: the page's own fallback still applies.
     }
   }
 
@@ -440,6 +483,9 @@ class IslandHandle extends ChangeNotifier {
   @override
   void dispose() {
     _files.dispose();
+    // A half-received export dies with the island it belonged to.
+    _saves.clear();
+    _saveBytes = 0;
     _readyTimer?.cancel();
     _themeTimer?.cancel();
     _requestGate?.cancel();
